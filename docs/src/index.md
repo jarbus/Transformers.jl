@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = Transformers
+```
+
 # Transformers.jl
 
 *Julia implementation of Transformers models*
@@ -22,6 +26,7 @@ Pages = [
   "layers.md",
   "textencoders.md",
   "huggingface.md",
+  "huggingface_dev.md",
 ]
 Depth = 3
 ```

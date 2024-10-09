@@ -19,7 +19,11 @@ makedocs(;
         "Tutorial" => "tutorial.md",
         "Layers" => "layers.md",
         "TextEncoders" => "textencoders.md",
-        "HuggingFace" => "huggingface.md",
+        "HuggingFace" => [
+            "User Interface" => "huggingface.md",
+            "Add New Models" => "huggingface_dev.md",
+        ],
+        "API Reference" => "api_ref.md",
         "ChangeLogs" => "changelog.md",
     ],
 )
