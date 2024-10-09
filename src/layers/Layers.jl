@@ -16,7 +16,6 @@ include("./base.jl")
 include("./embed.jl")
 include("./layer.jl")
 include("./attention_op.jl")
-include("./causal_flash_op.jl")
 include("./structwalk.jl")
 include("./testmode.jl")
 
