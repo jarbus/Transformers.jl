@@ -1,17 +1,19 @@
 module TextEncoders
 
+using BangBang
+using Tricks
 using PrimitiveOneHot
 using FuncPipelines
 using TextEncodeBase
-using TextEncodeBase: WordTokenization, nested2batch, nestedcall, with_head_tail, tokenize
+using TextEncodeBase: WordTokenization, nested2batch, nestedcall, with_head_tail, tokenize, join_text
 using ..WordPieceModel
 using BytePairEncoding
 using ..UnigramLanguageModel
 
 using NeuralAttentionlib: AttenMask, LengthMask, RevLengthMask, GenericSequenceMask
 
-export lookup, encode, decode, Vocab, OneHot, OneHotArray,
-    TransformerTextEncoder, BertTextEncoder, GPT2TextEncoder, T5TextEncoder
+export lookup, encode, decode, decode_text, Vocab, OneHot, OneHotArray,
+    TrfTextEncoder, TransformerTextEncoder, BertTextEncoder, GPT2TextEncoder, T5TextEncoder
 
 
 include("bert_tokenizer.jl")
@@ -25,29 +27,208 @@ abstract type AbstractTransformerTextEncoder <: AbstractTextEncoder end
 function Base.show(io::IO, e::AbstractTransformerTextEncoder)
     print(io, "$(nameof(typeof(e)))(\n├─ ")
     print(io, e.tokenizer)
+    _io = IOContext(io, :compact => true)
     for name in fieldnames(typeof(e))
         (name == :tokenizer || name == :process) && continue
         val = getfield(e, name)
-        isnothing(val) || print(io, ",\n├─ ", name, " = ",  val)
+        if !isnothing(val)
+            if val isa Base.Fix1{typeof(nestedcall)}
+                print(_io, ",\n├─ ", name, " = nestedcall")
+                val.x isa ComposedFunction || print(_io, '(')
+                FuncPipelines.show_pipeline_function(_io, val.x)
+                val.x isa ComposedFunction || print(_io, ')')
+            elseif !(val isa Pipelines) && val isa Function
+                print(_io, ",\n├─ ", name, " = ")
+                FuncPipelines.show_pipeline_function(_io, val)
+            else
+                print(_io, ",\n├─ ", name, " = ", val)
+            end
+        end
     end
     print(IOContext(io, :pipeline_display_prefix => "  ╰─ "), ",\n└─ process = ", e.process, "\n)")
 end
 
-struct TransformerTextEncoder{
-    T <: AbstractTokenizer, V <: AbstractVocabulary{String}, P
+"""
+    struct TrfTextEncoder{
+        T <: AbstractTokenizer,
+        V <: AbstractVocabulary{String},
+        C, A, EP, OP, DP, TP
+    } <: AbstractTransformerTextEncoder
+        tokenizer::T
+        vocab::V
+        config::C
+        annotate::A
+        process::EP
+        onehot::OP
+        decode::DP
+        textprocess::TP
+    end
+
+The general text encoder. `TrfTextEncoder` has multiple fields that can modify the encode/decode process:
+
+1. `.annotate` (default to `TextEncoders.annotate_strings`): Annotate the input string for the tokenizer,
+ e.g. `String` would be treated as a single sentence, not a single word.
+2. `.process` (default to `TextEncodeBase.nestedcall(TextEncoders.string_getvalue)`): The pre-process
+ function applied to the tokenization results, e.g. adding special `end-of-sentence` token, computing attention mask...
+3. `.onehot` (default to `TextEncoders.lookup_fist`): Apply onehot encoding on the preprocess result,
+ the default behavior takes the first element from the proprocess result and applies onehot encoding.
+4. `.decode` (default to `identity`): The function that converts each token id back to string. This can
+ be used to handle some tokenizers that use a different set of vocabulary such as gpt2's byte-level vocabulary.
+5. `.textprocess` (default to `TextEncodeBase.join_text`): the function that joins the `decode`-d result
+ in complete sentence(s).
+
+"""
+struct TrfTextEncoder{
+    T <: AbstractTokenizer,
+    V <: AbstractVocabulary{String},
+    C, A, EP, OP, DP, TP
 } <: AbstractTransformerTextEncoder
     tokenizer::T
     vocab::V
-    process::P
-    startsym::String
-    endsym::String
-    padsym::String
-    trunc::Union{Nothing, Int}
+    config::C
+    annotate::A
+    process::EP
+    onehot::OP
+    decode::DP
+    textprocess::TP
+end
+
+"""
+    TrfTextEncoder(
+        tokenizer     :: AbstractTokenizer ,
+        vocab         :: AbstractVocabulary{String} ,
+        [ annotate    =  TextEncoders.annotate_string ,
+        [ process     =  TextEncodeBase.nestedcall(TextEncoders.string_getvalue) ,
+        [ onehot      =  TextEncoders.lookup_first ,
+        [ decode      =  identity ,
+        [ textprocess =  TextEncodeBase.join_text, ]]]]]
+        ; config...)
+
+Constructor of `TrfTextEncoder`. All keyword arguments are store in the `.config` field.
+"""
+TrfTextEncoder(tokenizer::AbstractTokenizer, vocab::AbstractVocabulary{String}; kws...) =
+    TrfTextEncoder(tokenizer, vocab, annotate_strings; kws...)
+TrfTextEncoder(tokenizer::AbstractTokenizer, vocab::AbstractVocabulary{String}, annotate; kws...) =
+    TrfTextEncoder(tokenizer, vocab, annotate, nestedcall(string_getvalue); kws...)
+TrfTextEncoder(tokenizer::AbstractTokenizer, vocab::AbstractVocabulary{String}, annotate, process; kws...) =
+    TrfTextEncoder(tokenizer, vocab, annotate, process, lookup_first; kws...)
+TrfTextEncoder(tokenizer::AbstractTokenizer, vocab::AbstractVocabulary{String}, annotate, process, onehot; kws...) =
+    TrfTextEncoder(tokenizer, vocab, annotate, process, onehot, identity; kws...)
+TrfTextEncoder(tokenizer::AbstractTokenizer, vocab::AbstractVocabulary{String}, annotate, process, onehot, decode;
+               kws...) = TrfTextEncoder(tokenizer, vocab, annotate, process, onehot, decode, join_text; kws...)
+function TrfTextEncoder(tokenizer::AbstractTokenizer, vocab::AbstractVocabulary{String},
+                        annotate, process, onehot, decode, textprocess; kws...)
+    return TrfTextEncoder(tokenizer, vocab, values(kws), annotate, process, onehot, decode, textprocess)
+end
+
+for name in fieldnames(TrfTextEncoder)
+    (name == :tokenizer || name == :vocab) && continue
+    @eval $(quote
+        """
+            set_$($(QuoteNode(name)))(builder, e::TrfTextEncoder)
+
+        Return a new text encoder with the `$($(QuoteNode(name)))` field replaced with `builder(e)`.
+        """
+        function $(Symbol(:set_, name))(builder, e::TrfTextEncoder)
+            setproperty!!(e, $(QuoteNode(name)), builder(e))
+        end
+    end)
+end
+
+"""
+    set_tokenizer(builder, e::TrfTextEncoder)
+
+Return a new text encoder with the `tokenizer` field replaced with `builder(e)`. `builder` can either return
+ a `AbstractTokenizer` or a `AbstractTokenization`.
+"""
+function set_tokenizer(builder, e::TrfTextEncoder)
+    new_tkr = builder(e)
+    if !(new_tkr isa AbstractTokenizer)
+        new_tkr = TextTokenizer(new_tkr)
+    end
+    return setproperty!!(e, :tokenizer, new_tkr)
+end
+
+"""
+    set_vocab(builder, e::TrfTextEncoder)
+
+Return a new text encoder with the `vocab` field replaced with `builder(e)`. `builder` can either return
+ a `AbstractVocabulary{String}` or a `AbstractVector{String}`.
+"""
+function set_vocab(builder, e::TrfTextEncoder)
+    new_vocab = builder(e)
+    if !(new_vocab isa AbstractVocabulary)
+        new_vocab = Vocab(new_vocab, e.vocab.unk)
+    end
+    return TrfTextEncoder(
+        getfield(e, :tokenizer), new_vocab, getfield(e, :config),
+        getfield(e, :annotate), getfield(e, :process), getfield(e, :onehot),
+        getfield(e, :decode), getfield(e, :textprocess))
+end
+
+TrfTextEncoder(builder, e::TrfTextEncoder) = set_process(builder, e)
+
+function Base.getproperty(e::TrfTextEncoder, sym::Symbol)
+    if hasfield(TrfTextEncoder, sym)
+        return getfield(e, sym)
+    else
+        return getfield(e, :config)[sym]
+    end
+end
+
+@inline _membercall(f, e, x) = !(f isa Pipelines) && static_hasmethod(f, Tuple{typeof(e), typeof(x)}) ? f(e, x) : f(x)
+
+TextEncodeBase.process(::Type{<:TrfTextEncoder}) = nestedcall(string_getvalue)
+TextEncodeBase.tokenize(e::TrfTextEncoder, x) = getfield(e, :tokenizer)(_membercall(getfield(e, :annotate), e, x))
+TextEncodeBase.process(e::TrfTextEncoder, x) = _membercall(getfield(e, :process), e, x)
+TextEncodeBase.lookup(e::TrfTextEncoder, x) = _membercall(getfield(e, :onehot), e, x)
+TextEncodeBase.decode(e::TrfTextEncoder, x) = _membercall(getfield(e, :decode), e, TextEncodeBase.decode_indices(e, x))
+TextEncodeBase.decode_text(e::TrfTextEncoder, x) = _membercall(getfield(e, :textprocess), e, TextEncodeBase.decode(e, x))
+
+TextEncodeBase.decode_indices(e::TrfTextEncoder, x) = decode_indices(e, x)
+decode_indices(e::TrfTextEncoder, i::Union{Integer, OneHotArray, AbstractArray{<:Integer}}) =
+    lookup(String, getfield(e, :vocab), i)
+function decode_indices(e::TrfTextEncoder, x::AbstractArray)
+    if ndims(x) < 2
+        i = argmax(x)
+    else
+        amax = reshape(argmax(x; dims=1), Base.tail(size(x)))
+        i = selectdim(reinterpret(reshape, Int, amax), 1, 1)
+    end
+    return decode_indices(e, i)
+end
+
+annotate_strings(x::AbstractString) = Sentence(x)
+annotate_strings(x::Vector{<:AbstractString}) = Batch{Sentence}(x)
+annotate_strings(x::Vector{<:Vector{<:AbstractString}}) = Batch{Batch{Sentence}}(x)
+annotate_strings(x::Vector{<:Vector{<:Vector{<:AbstractString}}}) = Batch{Batch{Batch{Sentence}}}(x)
+
+TextEncodeBase.onehot_encode(e::TrfTextEncoder, x) = lookup(OneHot, getfield(e, :vocab), x)
+
+lookup_first(e::TrfTextEncoder, x) = TextEncodeBase.onehot_encode(e, x)
+lookup_first(e::TrfTextEncoder, x::Tuple) = (TextEncodeBase.onehot_encode(e, x[1]), Base.tail(x)...)
+function lookup_first(e::TrfTextEncoder, x::NamedTuple{name}) where name
+    xt = Tuple(x)
+    return NamedTuple{name}((TextEncodeBase.onehot_encode(e, xt[1]), Base.tail(xt)...))
 end
 
 # encoder constructor
 
 const WList = Union{AbstractVector, AbstractVocabulary}
+
+function TransformerTextEncoder(tkr::AbstractTokenizer, vocab::AbstractVocabulary{String}, process,
+                                startsym::String, endsym::String, padsym::String, trunc::Union{Nothing, Int})
+    return TrfTextEncoder(
+        tkr, vocab,
+        @NamedTuple{startsym::String, endsym::String, padsym::String, trunc::Union{Nothing, Int}}(
+            (startsym, endsym, padsym, trunc)),
+        annotate_strings,
+        process,
+        lookup_first,
+        identity,
+        join_text,
+    )
+end
 
 TransformerTextEncoder(tokenizef, v::WList, args...; kws...) =
     TransformerTextEncoder(WordTokenization(tokenize=tokenizef), v, args...; kws...)
@@ -94,28 +275,14 @@ function TransformerTextEncoder(tkr::AbstractTokenizer, v::WList;
             Pipeline{:token}(truncf, :token) |>
             # convert to dense array
             Pipeline{:token}(nested2batch, :token) |>
+            # sequence mask
+            Pipeline{:sequence_mask}(identity, :attention_mask) |>
             # return token and mask
-            PipeGet{(:token, :attention_mask)}()
+            PipeGet{(:token, :attention_mask, :sequence_mask)}()
     end
 end
 
-TransformerTextEncoder(builder, e::TransformerTextEncoder) = TransformerTextEncoder(
-    e.tokenizer, e.vocab, builder(e), e.startsym, e.endsym, e.padsym, e.trunc)
-
-# encoder behavior
-
-TextEncodeBase.tokenize(e::AbstractTransformerTextEncoder, x::AbstractString) = e.tokenizer(Sentence(x))
-TextEncodeBase.tokenize(e::AbstractTransformerTextEncoder, x::Vector{<:AbstractString}) = e.tokenizer(Batch{Sentence}(x))
-TextEncodeBase.tokenize(e::AbstractTransformerTextEncoder, x::Vector{<:Vector{<:AbstractString}}) =
-    e.tokenizer(Batch{Batch{Sentence}}(x))
-TextEncodeBase.tokenize(e::AbstractTransformerTextEncoder, x::Vector{<:Vector{<:Vector{<:AbstractString}}}) =
-    e.tokenizer(Batch{Batch{Batch{Sentence}}}(x))
-
-TextEncodeBase.lookup(e::AbstractTransformerTextEncoder, x::Tuple) = (lookup(e, x[1]), Base.tail(x)...)
-function TextEncodeBase.lookup(e::AbstractTransformerTextEncoder, x::NamedTuple{name}) where name
-    xt = Tuple(x)
-    return NamedTuple{name}((lookup(e, xt[1]), Base.tail(xt)...))
-end
+TransformerTextEncoder(builder, e::TrfTextEncoder) = TrfTextEncoder(builder, e)
 
 ## encoder-decoder encoding
 function TextEncodeBase.encode(e::AbstractTransformerTextEncoder, src, trg)
@@ -125,132 +292,8 @@ function TextEncodeBase.encode(e::AbstractTransformerTextEncoder, src, trg)
     return (encoder_input = psrc, decoder_input = merge(ptrg, (; cross_attention_mask)))
 end
 
-# decoder behavior
-function TextEncodeBase.decode(e::AbstractTransformerTextEncoder,
-                               i::Union{Integer, OneHotArray, AbstractArray{<:Integer}})
-    return TextEncodeBase.decode_indices(e, i)
-end
-
-function TextEncodeBase.decode(e::AbstractTransformerTextEncoder, x::AbstractArray)
-    if ndims(x) < 2
-        i = argmax(x)
-    else
-        amax = reshape(argmax(x; dims=1), Base.tail(size(x)))
-        i = selectdim(reinterpret(reshape, Int, amax), 1, 1)
-    end
-    return decode(e, i)
-end
-
-
 include("bert_textencoder.jl")
 include("gpt_textencoder.jl")
 include("t5_textencoder.jl")
-
-
-"""
-    struct TransformerTextEncoder{
-        T<:AbstractTokenizer, V<:AbstractVocabulary{String}, P
-    } <: AbstractTransformerTextEncoder
-        tokenizer::T
-        vocab::V
-        process::P
-        startsym::String
-        endsym::String
-        padsym::String
-        trunc::Union{Nothing, Int}
-    end
-
-The text encoder for general transformers. Taking a tokenizer, vocabulary, and a processing function, configured with
- a start symbol, an end symbol, a padding symbol, and a maximum length.
-
-    TransformerTextEncoder(tokenze, vocab, process; trunc = nothing,
-                           startsym = "<s>", endsym = "</s>", unksym = "<unk>", padsym = "<pad>")
-
-`tokenize` can be any tokenize function from `WordTokenizers`. `vocab` is either a list of word or a `Vocab`.
- `process` can be omitted, then a predefined processing pipeline will be used. When `vocab` is a list, those
- special symbol (e.g. `padsym`) would be added to the word list.
-
-    TransformerTextEncoder(f, e::TransformerTextEncoder)
-
-Take a text encoder and create a new text encoder with same configuration except the processing function.
- `f` is a function that take the encoder and return a new process function. This is useful for changing part of
- the procssing function.
-
-# Example
-```julia-repl
-julia> textenc = TransformerTextEncoder(labels; startsym, endsym, unksym,
-                                        padsym = unksym, trunc = 100)
-TransformerTextEncoder(
-├─ TextTokenizer(default),
-├─ vocab = Vocab{String, SizedArray}(size = 37678, unk = </unk>, unki = 1),
-├─ startsym = <s>,
-├─ endsym = </s>,
-├─ padsym = </unk>,
-├─ trunc = 100,
-└─ process = Pipelines:
-  ╰─ target[token] := TextEncodeBase.nestedcall(string_getvalue, source)
-  ╰─ target[token] := TextEncodeBase.with_head_tail(<s>, </s>)(target.token)
-  ╰─ target[attention_mask] := (NeuralAttentionlib.LengthMask ∘ Transformers.TextEncoders.getlengths(10))(target.token)
-  ╰─ target[token] := TextEncodeBase.trunc_and_pad(10, <pad>, tail, tail)(target.token)
-  ╰─ target[token] := TextEncodeBase.nested2batch(target.token)
-  ╰─ target := (target.token, target.attention_mask)
-)
-
-julia> TransformerTextEncoder(ans) do enc
-           enc.process[1] |> TextEncoders.Pipelines(enc.process[4:5]) |> TextEncoders.PipeGet{(:token,)}()
-       end
-TransformerTextEncoder(
-├─ TextTokenizer(default),
-├─ vocab = Vocab{String, SizedArray}(size = 37678, unk = </unk>, unki = 1),
-├─ startsym = <s>,
-├─ endsym = </s>,
-├─ padsym = </unk>,
-├─ trunc = 100,
-└─ process = Pipelines:
-  ╰─ target[token] := TextEncodeBase.nestedcall(string_getvalue, source)
-  ╰─ target[token] := TextEncodeBase.trunc_and_pad(10, <pad>, tail, tail)(target.token)
-  ╰─ target[token] := TextEncodeBase.nested2batch(target.token)
-  ╰─ target := (target.token)
-)
-
-```
-"""
-TransformerTextEncoder
-
-"""
-    encode(e::AbstractTransformerTextEncoder, input::Union{
-        String,                         # single sentence
-        Vector{String},                 # batch of sentences
-        Vector{Vector{String}},         # batch of multi-segment sentences
-        Vector{Vector{Vector{String}}}  # batch of multi-sample multi-segment sentences
-    })
-
-Tokenize the `input` and apply the processing function on the tokenized result. The `input` can be either a single
- `String` (1 sample) or a nested vector of `String` up to depth 3 (batch of samples). How batch input is transformed
- is defined by the bound processing function. The result of the processing function (first if return tuple) would be
- converted into one-hot encoding with the bound vocabulary.
-
-    encode(e::AbstractTransformerTextEncoder, src, trg)
-
-Apply `encode` on `src` and `trg` and build the cross attention mask. This is just a convenient function for doing
- encoder-decoder tasks. Return a `@NamedTuple{encoder_input, decoder_input}` where `encoder_input` is just
- `encode(e, src)` and `decoder_input` is `encode(e, trg)` + the cross attention mask.
-"""
-TextEncodeBase.encode(e::AbstractTransformerTextEncoder, x)
-
-"""
-    decode(e::AbstractTransformerTextEncoder, x::Union{
-        Integer,
-        OneHotArray,
-        AbstractArray{<:Integer}
-    })
-
-Decode the one-hot encoding or indices into `String` (or `Array{String}`) from the bound vocabulary.
-
-    decode(e::AbstractTransformerTextEncoder, x::AbstractArray)
-
-Perform `argmax(x; dims = 1)` and then `decode`. `x` should be `collect`ed beforehand if it's on GPU.
-"""
-TextEncodeBase.decode(e::AbstractTransformerTextEncoder, x)
 
 end

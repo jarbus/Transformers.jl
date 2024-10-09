@@ -2,6 +2,7 @@
     using Logging
     using Transformers.HuggingFace
     model_list = Dict([
+        :bart => [:Model],
         :bert => :[
             Model, ForPreTraining, LMHeadModel, ForMaskedLM, ForNextSentencePrediction,
             ForSequenceClassification, ForTokenClassification, ForQuestionAnswering,
@@ -15,6 +16,8 @@
         :gptj => [:Model, :ForCausalLM],
         :gpt_neox => [:Model, :ForCausalLM],
         :bloom => [:Model, :ForCausalLM],
+        :phi => [:Model, :ForCausalLM], 
+        :clip => [:Model],
         # :llama => [:Model, :ForCausalLM], No hf-internal-testing/tiny-random-$hgf_type_name
     ])
 
